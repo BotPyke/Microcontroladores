@@ -1,0 +1,309 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+
+// Definiciones de estados
+#define ESTADO_INICIAL       0
+#define ESTADO_ABRIENDO      1
+#define ESTADO_CERRANDO      2
+#define ESTADO_CERRADO       3
+#define ESTADO_ABIERTO       4
+#define ESTADO_EMERGENCIA    5
+#define ESTADO_ERROR         6
+#define ESTADO_ESPERA        7
+
+// Pines de botones
+#define BOTON_ABRIR          GPIO_NUM_13
+#define BOTON_CERRAR         GPIO_NUM_12
+#define BOTON_CERRADO        GPIO_NUM_14
+#define BOTON_ABIERTO        GPIO_NUM_27
+
+// Pines de LEDs
+#define LED_APERTURA         GPIO_NUM_15
+#define LED_CIERRE           GPIO_NUM_4
+#define LED_ERROR            GPIO_NUM_16
+
+// Variables globales
+volatile int ESTADO_ACTUAL = ESTADO_INICIAL;
+volatile int ESTADO_SIGUIENTE = ESTADO_INICIAL;
+volatile int ESTADO_ANTERIOR = ESTADO_INICIAL; // Almacena el estado anterior antes del error
+volatile int ESTADO_POST_ERROR = ESTADO_INICIAL; // Almacena el estado después del error pero antes de la espera
+
+// Variables para la detección de cambios
+static int boton_abrir_prev = 1;
+static int boton_cerrar_prev = 1;
+static int boton_cerrado_prev = 1;
+static int boton_abierto_prev = 1;
+
+// Variables para el parpadeo del LED de error
+static int led_error_state = 0;
+static const int parpadeo_intervalo = 500; // Intervalo de parpadeo en milisegundos
+static int espera_timer = 0; // Temporizador para el estado de espera
+
+// Flag para controlar la impresión de estado de emergencia
+static int emergencia_imprimida = 0;
+
+// Configuración de pines
+void configurar_pines() {
+    gpio_config_t io_conf;
+
+    // Configura los pines de entrada (botones) con pull-up
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << BOTON_ABRIR) | (1ULL << BOTON_CERRAR) |
+                           (1ULL << BOTON_CERRADO) | (1ULL << BOTON_ABIERTO);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+
+    // Configura los pines de salida (LEDs)
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = (1ULL << LED_APERTURA) | (1ULL << LED_CIERRE) | (1ULL << LED_ERROR);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+}
+
+// Función para imprimir el estado actual y las salidas
+void imprimir_estado(int cambio) {
+    if (cambio) {
+        printf("Estado Actual: %d\n", ESTADO_ACTUAL);
+
+        // Lectura de los botones
+        int boton_abrir = gpio_get_level(BOTON_ABRIR);
+        int boton_cerrar = gpio_get_level(BOTON_CERRAR);
+        int boton_cerrado = gpio_get_level(BOTON_CERRADO);
+        int boton_abierto = gpio_get_level(BOTON_ABIERTO);
+
+        if (boton_abrir != boton_abrir_prev) {
+            printf("Botón Abrir: %d\n", boton_abrir);
+            boton_abrir_prev = boton_abrir;
+        }
+
+        if (boton_cerrar != boton_cerrar_prev) {
+            printf("Botón Cerrar: %d\n", boton_cerrar);
+            boton_cerrar_prev = boton_cerrar;
+        }
+
+        if (boton_cerrado != boton_cerrado_prev) {
+            printf("Botón Cerrado: %d\n", boton_cerrado);
+            boton_cerrado_prev = boton_cerrado;
+        }
+
+        if (boton_abierto != boton_abierto_prev) {
+            printf("Botón Abierto: %d\n", boton_abierto);
+            boton_abierto_prev = boton_abierto;
+        }
+
+        // Estado de los LEDs
+        int led_apertura = gpio_get_level(LED_APERTURA);
+        int led_cierre = gpio_get_level(LED_CIERRE);
+        int led_error = gpio_get_level(LED_ERROR);
+
+        if (led_apertura != gpio_get_level(LED_APERTURA)) {
+            printf("LED Apertura: %d\n", led_apertura);
+        }
+
+        if (led_cierre != gpio_get_level(LED_CIERRE)) {
+            printf("LED Cierre: %d\n", led_cierre);
+        }
+
+        if (led_error != gpio_get_level(LED_ERROR)) {
+            printf("LED Error: %d\n", led_error);
+        }
+
+        printf("-----------------------\n");
+
+        // Reinicia la bandera de impresión de emergencia si estamos en otro estado
+        if (ESTADO_ACTUAL != ESTADO_EMERGENCIA) {
+            emergencia_imprimida = 0;
+        }
+    }
+}
+
+// Tarea de control de estados
+void vTaskControl(void *pvParameters) {
+    while (1) {
+        int cambio = 0;
+
+        // Lee el estado actual de los botones solo si no estamos en estado de espera
+        int boton_abrir = (ESTADO_ACTUAL != ESTADO_ESPERA) ? gpio_get_level(BOTON_ABRIR) : 1;
+        int boton_cerrar = (ESTADO_ACTUAL != ESTADO_ESPERA) ? gpio_get_level(BOTON_CERRAR) : 1;
+        int boton_cerrado = (ESTADO_ACTUAL != ESTADO_ESPERA) ? gpio_get_level(BOTON_CERRADO) : 1;
+        int boton_abierto = (ESTADO_ACTUAL != ESTADO_ESPERA) ? gpio_get_level(BOTON_ABIERTO) : 1;
+
+        // Verifica las nuevas condiciones de entrada
+        if (boton_abrir == 0 && boton_cerrar == 0) {
+            // Entrar en estado de emergencia solo si no se ha impreso antes
+            if (!emergencia_imprimida) {
+                ESTADO_SIGUIENTE = ESTADO_EMERGENCIA;
+                emergencia_imprimida = 1; // Marca la impresión de emergencia
+                cambio = 1;
+            }
+        } else if (boton_cerrado == 0 && ESTADO_ACTUAL == ESTADO_INICIAL) {
+            // Entrar en estado de error desde el estado inicial si se presiona el botón de cerrado
+            ESTADO_SIGUIENTE = ESTADO_ERROR;
+            cambio = 1;
+        } else if (boton_cerrado == 0 && boton_abierto == 0) {
+            // Entrar en estado de error si se presionan ambos botones
+            ESTADO_SIGUIENTE = ESTADO_ERROR;
+            cambio = 1;
+        } else if (ESTADO_ACTUAL == ESTADO_ABRIENDO && boton_cerrado == 0) {
+            // Entrar en estado de error desde el estado de abriendo si se presiona el botón de cerrado
+            ESTADO_SIGUIENTE = ESTADO_ERROR;
+            cambio = 1;
+        } else if (boton_abrir == 0 && ESTADO_ACTUAL == ESTADO_INICIAL) {
+            // Si se presiona el botón de abrir, cambiar al estado de abriendo desde el estado inicial
+            ESTADO_SIGUIENTE = ESTADO_ABRIENDO;
+            cambio = 1;
+        } else if (boton_cerrar == 0 && ESTADO_ACTUAL == ESTADO_INICIAL) {
+            // Si se presiona el botón de cerrar, cambiar al estado de cierre desde el estado inicial
+            ESTADO_SIGUIENTE = ESTADO_CERRANDO;
+            cambio = 1;
+        } else if (boton_abrir == 0 && ESTADO_ACTUAL == ESTADO_ESPERA) {
+            // En el estado de espera, el botón de abrir también puede cambiar al estado de abriendo
+            ESTADO_SIGUIENTE = ESTADO_ABRIENDO;
+            cambio = 1;
+        } else if (ESTADO_ACTUAL == ESTADO_ESPERA) {
+            // Si estamos en estado de espera y se supera el tiempo de espera, regresamos al estado inicial
+            espera_timer++;
+            if (espera_timer >= 500 / portTICK_PERIOD_MS) {
+                ESTADO_SIGUIENTE = ESTADO_INICIAL;
+                espera_timer = 0;
+                cambio = 1;
+            }
+        } else if (ESTADO_ACTUAL == ESTADO_ERROR) {
+            // Si estamos en estado de error y se repite, regresamos al estado inicial
+            espera_timer++;
+            if (espera_timer >= 500 / portTICK_PERIOD_MS) {
+                ESTADO_SIGUIENTE = ESTADO_INICIAL;
+                espera_timer = 0;
+                cambio = 1;
+            }
+        }
+
+        // Lógica del cambio de estados
+        switch (ESTADO_ACTUAL) {
+            case ESTADO_INICIAL:
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 0);
+                gpio_set_level(LED_ERROR, 0);
+                if (boton_abrir == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_ABRIENDO;
+                    cambio = 1;
+                } else if (boton_cerrar == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_CERRANDO;
+                    cambio = 1;
+                }
+                break;
+            case ESTADO_ABRIENDO:
+                gpio_set_level(LED_APERTURA, 1);
+                gpio_set_level(LED_CIERRE, 0);
+                gpio_set_level(LED_ERROR, 0);
+                if (boton_abierto == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_ABIERTO;
+                    cambio = 1;
+                } else if (boton_cerrado == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_ERROR;
+                    cambio = 1;
+                }
+                break;
+            case ESTADO_CERRANDO:
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 1);
+                gpio_set_level(LED_ERROR, 0);
+                if (boton_cerrado == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_CERRADO;
+                    cambio = 1;
+                } else if (boton_abierto == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_ERROR;
+                    cambio = 1;
+                }
+                break;
+            case ESTADO_CERRADO:
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 0);
+                gpio_set_level(LED_ERROR, 0);
+                if (boton_abrir == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_ABRIENDO;
+                    cambio = 1;
+                }
+                break;
+            case ESTADO_ABIERTO:
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 0);
+                gpio_set_level(LED_ERROR, 0);
+                if (boton_cerrar == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_CERRANDO;
+                    cambio = 1;
+                }
+                break;
+            case ESTADO_EMERGENCIA:
+                // Mantén el estado de emergencia hasta que se presione el botón de cerrar
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 0);
+                gpio_set_level(LED_ERROR, 1);
+                if (boton_cerrar == 0) {
+                    ESTADO_SIGUIENTE = ESTADO_CERRADO;
+                    cambio = 1;
+                }
+                break;
+            case ESTADO_ERROR:
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 0);
+                led_error_state = !led_error_state;
+                gpio_set_level(LED_ERROR, led_error_state);
+                vTaskDelay(pdMS_TO_TICKS(parpadeo_intervalo));
+                if (boton_abrir == 0) {
+                    // Salir del estado de error y pasar al estado de espera
+                    ESTADO_SIGUIENTE = ESTADO_ESPERA;
+                    espera_timer = 0; // Reinicia el temporizador de espera
+                    cambio = 1;
+                    // Almacena el estado anterior antes de pasar al estado de espera
+                    ESTADO_POST_ERROR = ESTADO_ANTERIOR;
+                }
+                break;
+            case ESTADO_ESPERA:
+                gpio_set_level(LED_APERTURA, 0);
+                gpio_set_level(LED_CIERRE, 0);
+                gpio_set_level(LED_ERROR, 0);
+                espera_timer++;
+                // No hay cambio de estado mientras se está en espera
+                if (espera_timer >= 500 / portTICK_PERIOD_MS) {
+                    // Después de 1 segundo en el estado de espera
+                    ESTADO_SIGUIENTE = ESTADO_POST_ERROR;
+                    espera_timer = 0;
+                    cambio = 1;
+                    // Almacena el estado anterior antes de salir del estado de espera
+                    ESTADO_POST_ERROR = ESTADO_ANTERIOR;
+                }
+                break;
+            default:
+                ESTADO_SIGUIENTE = ESTADO_INICIAL;
+                cambio = 1;
+                break;
+        }
+
+        // Actualiza el estado actual si ha habido un cambio
+        if (cambio) {
+            ESTADO_ANTERIOR = ESTADO_ACTUAL;
+            ESTADO_ACTUAL = ESTADO_SIGUIENTE;
+        }
+
+        // Imprime el estado y las salidas solo si hay un cambio
+        imprimir_estado(cambio);
+
+        // Retraso para evitar el consumo excesivo de CPU
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void app_main() {
+    // Configuración de pines
+    configurar_pines();
+
+    // Creación de la tarea de control de estados
+    xTaskCreate(vTaskControl, "vTaskControl", 4096, NULL, 5, NULL);
+}
