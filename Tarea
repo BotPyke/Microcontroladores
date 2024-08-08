@@ -1,0 +1,93 @@
+#include <stdio.h>
+#include <math.h>
+#include "driver/adc.h"
+#include "esp_system.h"
+#include "esp_log.h"
+
+// Definiciones
+#define ADC_WIDTH ADC_WIDTH_BIT_12    // Resolución del ADC: 12 bits
+#define ADC_CHANNEL ADC1_CHANNEL_0   // Canal ADC1_0 (GPIO36)
+#define SAMPLE_COUNT 100             // Número de muestras para calcular el RMS
+#define INTERVAL_MS 1                // Intervalo de interrupción en milisegundos
+
+// Variables globales
+static uint32_t samples[SAMPLE_COUNT];   // Array para almacenar las muestras del ADC
+static uint32_t sample_index = 0;        // Índice actual de la muestra
+
+// Prototipos de funciones
+static void IRAM_ATTR timer_isr(void *arg);
+static void configure_timer(void);
+static void configure_adc(void);
+static void calculate_rms(void);
+
+void app_main(void)
+{
+    configure_adc();        // Configura el ADC
+    configure_timer();      // Configura el temporizador
+    
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Espera 1 segundo antes de calcular el RMS
+        calculate_rms();   // Calcula y muestra el valor RMS
+    }
+}
+
+// Función de interrupción del temporizador
+static void IRAM_ATTR timer_isr(void *arg)
+{
+    // Captura una muestra del ADC y almacénala en el array de muestras
+    samples[sample_index] = adc1_get_raw(ADC_CHANNEL);
+    
+    // Avanza al siguiente índice de muestra, reutiliza el array cuando sea necesario
+    sample_index = (sample_index + 1) % SAMPLE_COUNT;
+    
+    // Limpia la interrupción del temporizador
+    TIMERG0.int_clr_timers.t0 = 1;
+}
+
+// Configura el temporizador
+static void configure_timer(void)
+{
+    const esp_timer_create_args_t timer_args = {
+        .callback = timer_isr,     // Función a llamar en la interrupción del temporizador
+        .name = "timer"            // Nombre del temporizador
+    };
+    
+    esp_timer_handle_t timer;
+    
+    // Crea el temporizador
+    esp_timer_create(&timer_args, &timer);
+    
+    // Inicia el temporizador con el intervalo especificado (en microsegundos)
+    esp_timer_start_periodic(timer, INTERVAL_MS * 1000);
+}
+
+// Configura el ADC
+static void configure_adc(void)
+{
+    // Configura la resolución del ADC
+    adc1_config_width(ADC_WIDTH);
+    
+    // Configura la atenuación del canal del ADC
+    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_0);
+}
+
+// Calcula el valor RMS de las muestras capturadas
+static void calculate_rms(void)
+{
+    uint32_t sum = 0;
+    
+    // Suma los cuadrados de todas las muestras
+    for (int i = 0; i < SAMPLE_COUNT; i++) {
+        uint32_t sample = samples[i];
+        sum += sample * sample;
+    }
+    
+    // Calcula el promedio de los cuadrados de las muestras
+    double mean = sum / (double)SAMPLE_COUNT;
+    
+    // Calcula la raíz cuadrada del promedio para obtener el valor RMS
+    double rms = sqrt(mean);
+    
+    // Imprime el valor RMS en voltios (escala del ADC: 3.3V / 4096 niveles)
+    printf("RMS Voltage: %.2f\n", (rms * 3.3 / 4096));
+}
