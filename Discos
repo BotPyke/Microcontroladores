@@ -1,0 +1,174 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+
+// Tamaño máximo del buffer
+#define BUFFER_SIZE 256
+
+// Estructura para representar a un alumno
+typedef struct {
+    char nombre[50];
+    int edad;
+    float calificacion;
+} Alumno;
+
+// Prototipos de funciones para manejar archivos
+void init_spiffs();
+void crear_archivo();
+void leer_archivo();
+void agregar_alumno(Alumno *alumno);
+void cargar_alumnos(Alumno **alumnos, int *num_alumnos);
+void liberar_alumnos(Alumno *alumnos, int num_alumnos);
+
+void app_main(void) {
+    int opcion;
+    Alumno *alumnos = NULL;
+    int num_alumnos = 0;
+
+    // Inicializa el sistema de archivos SPIFFS
+    init_spiffs();
+
+    while (1) {
+        printf("1. Leer disco\n");
+        printf("2. Grabar dato\n");
+        printf("3. Salir\n");
+        printf("Ingrese una opción: ");
+        scanf("%d", &opcion);
+
+        switch (opcion) {
+            case 1:
+                // Leer el archivo y mostrar contenido
+                leer_archivo();
+                break;
+            case 2: {
+                // Grabar un dato
+                Alumno nuevo_alumno;
+                printf("Ingrese el nombre del alumno: ");
+                scanf("%s", nuevo_alumno.nombre);
+                printf("Ingrese la edad del alumno: ");
+                scanf("%d", &nuevo_alumno.edad);
+                printf("Ingrese la calificación del alumno: ");
+                scanf("%f", &nuevo_alumno.calificacion);
+
+                // Agrega el nuevo alumno al archivo
+                agregar_alumno(&nuevo_alumno);
+                
+                char respuesta[2];
+                printf("¿Desea agregar otro registro? (s/n): ");
+                scanf("%s", respuesta);
+                if (respuesta[0] != 's') {
+                    // Salir del bucle si la respuesta no es 's'
+                    break;
+                }
+                break;
+            }
+            case 3:
+                // Salir del programa
+                liberar_alumnos(alumnos, num_alumnos);
+                esp_spiffs_unmount();  // Desmontar SPIFFS
+                return;
+            default:
+                printf("Opción inválida. Intente de nuevo.\n");
+                break;
+        }
+    }
+}
+
+// Inicializa el sistema de archivos SPIFFS
+void init_spiffs() {
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",       // Ruta base para SPIFFS
+        .partition_label = NULL,     // Etiqueta de la partición (NULL usa la predeterminada)
+        .max_files = 5,              // Número máximo de archivos abiertos
+        .format_if_mount_failed = true // Formatear si el montaje falla
+    };
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE("SPIFFS", "Error al inicializar SPIFFS (%s)", esp_err_to_name(ret));
+        return;
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info(NULL, &total, &used);
+    if (ret != ESP_OK) {
+        ESP_LOGE("SPIFFS", "Error al obtener información de la partición SPIFFS (%s)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI("SPIFFS", "Tamaño de la partición SPIFFS: total: %d, usado: %d", total, used);
+    }
+}
+
+// Crea un archivo vacío llamado "alumnos.txt"
+void crear_archivo() {
+    FILE *f = fopen("/spiffs/alumnos.txt", "w");
+    if (f == NULL) {
+        printf("Error al crear el archivo\n");
+        return;
+    }
+    fclose(f);
+}
+
+// Lee el archivo "alumnos.txt" y muestra el contenido en pantalla
+void leer_archivo() {
+    FILE *f = fopen("/spiffs/alumnos.txt", "r");
+    if (f == NULL) {
+        printf("Error al abrir el archivo\n");
+        return;
+    }
+
+    Alumno alumno;
+    while (fread(&alumno, sizeof(Alumno), 1, f)) {
+        printf("Nombre: %s\n", alumno.nombre);
+        printf("Edad: %d\n", alumno.edad);
+        printf("Calificación: %.2f\n", alumno.calificacion);
+        printf("\n");
+    }
+
+    fclose(f);
+}
+
+// Agrega un nuevo alumno al archivo "alumnos.txt"
+void agregar_alumno(Alumno *alumno) {
+    FILE *f = fopen("/spiffs/alumnos.txt", "a");
+    if (f == NULL) {
+        printf("Error al abrir el archivo\n");
+        return;
+    }
+
+    fwrite(alumno, sizeof(Alumno), 1, f);
+    fclose(f);
+}
+
+// Carga los datos de los alumnos desde el archivo en memoria dinámica
+void cargar_alumnos(Alumno **alumnos, int *num_alumnos) {
+    FILE *f = fopen("/spiffs/alumnos.txt", "r");
+    if (f == NULL) {
+        printf("Error al abrir el archivo\n");
+        return;
+    }
+
+    fseek(f, 0, SEEK_END); // Mover al final del archivo
+    long size = ftell(f); // Obtener el tamaño del archivo
+    fseek(f, 0, SEEK_SET); // Volver al principio del archivo
+
+    *num_alumnos = size / sizeof(Alumno); // Calcular el número de alumnos
+    *alumnos = (Alumno *)malloc(size); // Asignar memoria dinámica
+    if (*alumnos == NULL) {
+        printf("Error al asignar memoria\n");
+        fclose(f);
+        return;
+    }
+
+    fread(*alumnos, sizeof(Alumno), *num_alumnos, f); // Leer los datos en memoria
+    fclose(f);
+}
+
+// Libera la memoria asignada dinámicamente para los alumnos
+void liberar_alumnos(Alumno *alumnos, int num_alumnos) {
+    if (alumnos != NULL) {
+        free(alumnos);
+    }
+}
